@@ -101,6 +101,26 @@ log_section() {
     echo -e "══════════════════════════════════════"
 }
 
+ensure_rg_available() {
+    if command -v rg &>/dev/null; then
+        return 0
+    fi
+    log_warn "未检测到 rg（ripgrep），尝试通过 Homebrew 自动安装..."
+    if command -v brew &>/dev/null; then
+        if brew install ripgrep --quiet; then
+            log_ok "ripgrep 安装成功"
+        else
+            log_error "ripgrep 安装失败，请手动执行：brew install ripgrep"
+            exit 1
+        fi
+    else
+        log_error "未找到 rg（ripgrep），且 Homebrew 不可用"
+        log_error "请手动安装：brew install ripgrep"
+        log_error "或参考：https://github.com/BurntSushi/ripgrep#installation"
+        exit 1
+    fi
+}
+
 ensure_pip_available() {
     local python_bin="$1"
     if "$python_bin" -m pip --version >/dev/null 2>&1; then
@@ -405,6 +425,7 @@ if ! command -v hermes &>/dev/null; then
     log_error "未找到 hermes 命令，请确认 Hermes Agent 已安装。"
     exit 1
 fi
+ensure_rg_available
 log_ok "Hermes 已安装：$(hermes --version 2>/dev/null || echo '版本未知')"
 # 提前创建备份目录，供插件自动恢复时落盘备份
 mkdir -p "$BACKUP_DIR"

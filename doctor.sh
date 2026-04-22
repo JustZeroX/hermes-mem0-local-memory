@@ -63,6 +63,26 @@ PIP_RETRIES=10
 PATCH_ONLY=false
 CHECK_ONLY=false
 
+ensure_rg_available() {
+    if command -v rg &>/dev/null; then
+        return 0
+    fi
+    echo "[WARN]  未检测到 rg（ripgrep），尝试通过 Homebrew 自动安装..."
+    if command -v brew &>/dev/null; then
+        if brew install ripgrep --quiet; then
+            echo "[OK]    ripgrep 安装成功"
+        else
+            echo "[ERROR] ripgrep 安装失败，请手动执行：brew install ripgrep"
+            exit 1
+        fi
+    else
+        echo "[ERROR] 未找到 rg（ripgrep），且 Homebrew 不可用"
+        echo "[ERROR] 请手动安装：brew install ripgrep"
+        echo "[ERROR] 或参考：https://github.com/BurntSushi/ripgrep#installation"
+        exit 1
+    fi
+}
+
 for arg in "$@"; do
   case "$arg" in
     --patch-only) PATCH_ONLY=true ;;
@@ -239,6 +259,7 @@ main() {
 
   [[ -d "$HERMES_HOME" ]] || { log_error "目录不存在：$HERMES_HOME"; exit 1; }
   [[ -x "$HERMES_PYTHON" ]] || { log_error "解释器不可执行：$HERMES_PYTHON"; exit 1; }
+  ensure_rg_available
 
   if [[ "$CHECK_ONLY" == "true" ]]; then
     check_status && exit 0 || exit 1
