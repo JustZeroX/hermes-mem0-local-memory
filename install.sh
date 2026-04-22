@@ -1,43 +1,73 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy_mem0_isolation.sh  v4.1
+# install.sh  v0.0.1
 #
 # 方案说明：
 #   - 零源码修改，仅通过配置切换 Hermes 记忆后端为 Mem0 本地 SQLite 模式
 #   - 按飞书 user_id 隔离每位用户的记忆，避免多用户共用时的记忆污染
-#   - 第一阶段只禁用 session_search，保留 memory 工具观察 Mem0 写入情况
-#
-# 修订历史：
-#   v4.1  固化实操必要步骤：插件自动恢复、USER.md 只读(444)加固
-#   v4.0  自动修复 mem0 插件（从模板恢复）；部署脚本与更新后自愈脚本联动
-#   v3.9  对齐本次实操：校验 mem0 插件本地模式、安装 fastembed、local smoke test
-#   v3.8  pip 自举与安装重试；config show/list 兼容；smoke test 降噪
-#   v3.7  config 顶层类型防御；.env sed 替换值转义 & 字符
-#   v3.6  memory/tools 顶层类型防御；.env 兼容 export KEY= 写法
-#   v3.5  tools.disabled null/str/非序列标准化 + 保序去重 + 格式重写警告
-#   v3.4  write_env_config 移除 eval 改用 case；smoke test 降级为库级检查
-#   v3.3  HERMES_HOME/HERMES_PYTHON 写死实际路径；移除 virtualenv 死分支
-#   v3.2  Bash 3.2 兼容；TIMESTAMP 补充定义；参数透传修复
-#   v3.1  config.yaml 确认；.env 双通道写入；--yes/--purge-data 语义分离
+#   - 禁用 session_search，防止跨用户记忆污染
 #
 # 使用方法：
-#   chmod +x deploy_mem0_isolation.sh
-#   ./deploy_mem0_isolation.sh
+#   chmod +x install.sh
+#   ./install.sh
 #
-# 回滚：./rollback_mem0_isolation.sh
-# 卸载：./uninstall_mem0_isolation.sh
-# 更新后自愈：./mem0_post_update_selfheal.sh
+# 回滚：./rollback.sh
+# 卸载：./uninstall.sh
+# 更新后自愈：./doctor.sh
 # =============================================================================
 
 set -euo pipefail
 
 # ══════════════════════════════════════════════
-# 本地配置区（环境迁移时只需改这里）
+# 路径自动探测（通常无需任何配置）
+#
+# 推导链：hermes shebang → HERMES_PYTHON → 上4级 → HERMES_HOME
+# 如需手动覆盖，执行前 export 即可：
+#   export HERMES_HOME=/your/hermes/path
+#   export HERMES_PYTHON=/path/to/python3
 # ══════════════════════════════════════════════
 
-HERMES_HOME="/Users/p/.hermes"
-HERMES_PYTHON="/Users/p/.hermes/hermes-agent/venv/bin/python3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+_detect_hermes_paths() {
+    # Step 1: 从 hermes 命令 shebang 读取 HERMES_PYTHON
+    if [[ -z "${HERMES_PYTHON:-}" ]]; then
+        local _bin _py
+        _bin=$(command -v hermes 2>/dev/null || true)
+        if [[ -n "$_bin" ]]; then
+            _py=$(head -1 "$_bin" 2>/dev/null | sed 's/^#!//' | tr -d '[:space:]')
+            [[ "$_py" == *python* && -x "$_py" ]] && HERMES_PYTHON="$_py"
+        fi
+    fi
+
+    # Step 2: 从 HERMES_PYTHON 推导 HERMES_AGENT_DIR（上3级）和 HERMES_HOME（上4级）
+    #   结构：<HERMES_HOME> / <agent-dir> / venv / bin / python3
+    if [[ -n "${HERMES_PYTHON:-}" ]]; then
+        [[ -z "${HERMES_AGENT_DIR:-}" ]] && \
+            HERMES_AGENT_DIR="$(dirname "$(dirname "$(dirname "$HERMES_PYTHON")")")"
+        [[ -z "${HERMES_HOME:-}" ]] && \
+            HERMES_HOME="$(dirname "$HERMES_AGENT_DIR")"
+    fi
+
+    # Step 3: 兜底默认路径
+    HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+    HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
+    HERMES_PYTHON="${HERMES_PYTHON:-$HERMES_AGENT_DIR/venv/bin/python3}"
+
+    # Step 4: 校验
+    if [[ ! -d "$HERMES_HOME" ]]; then
+        echo "[ERROR] Hermes 主目录不存在：$HERMES_HOME"
+        echo "  请手动设置：export HERMES_HOME=/your/hermes/path"
+        exit 1
+    fi
+    if [[ ! -x "$HERMES_PYTHON" ]]; then
+        echo "[ERROR] Python 解释器不可执行：$HERMES_PYTHON"
+        echo "  请手动设置：export HERMES_PYTHON=/path/to/python3"
+        exit 1
+    fi
+}
+
+_detect_hermes_paths
 
 # 以下路径均基于 HERMES_HOME，一般不需要改动
 MEM0_DATA_DIR="$HERMES_HOME/mem0_data"
@@ -46,8 +76,8 @@ CONFIG_FILE="$HERMES_HOME/config.yaml"
 ENV_FILE="$HERMES_HOME/.env"
 SOUL_FILE="$HERMES_HOME/SOUL.md"
 USER_FILE="$MEMORIES_DIR/USER.md"
-MEM0_PLUGIN_FILE="$HERMES_HOME/hermes-agent/plugins/memory/mem0/__init__.py"
-MEM0_PLUGIN_CACHE_FILE="$SCRIPT_DIR/mem0_plugin_local.cached.py"
+MEM0_PLUGIN_FILE="$HERMES_AGENT_DIR/plugins/memory/mem0/__init__.py"
+MEM0_PLUGIN_CACHE_FILE="$SCRIPT_DIR/mem0_plugin_patch.py"
 
 # ══════════════════════════════════════════════
 # 运行时变量（不需要修改）
@@ -117,7 +147,7 @@ ensure_mem0_plugin_local_support() {
     log_warn "检测到 mem0 插件不是本地增强版，尝试从缓存自动恢复..."
     if [[ ! -f "$MEM0_PLUGIN_CACHE_FILE" ]]; then
         log_error "未找到插件缓存：$MEM0_PLUGIN_CACHE_FILE"
-        log_error "请先执行：$SCRIPT_DIR/mem0_post_update_selfheal.sh --patch-only"
+        log_error "请先执行：$SCRIPT_DIR/doctor.sh --patch-only"
         return 1
     fi
     cp "$plugin_file" "$BACKUP_DIR/mem0_plugin.__init__.py.before_restore.bak"
@@ -277,7 +307,7 @@ write_env_config() {
     done
 
     if ! grep -q "# MEM0_ISOLATION_MARKER" "$env_path" 2>/dev/null; then
-        echo "# MEM0_ISOLATION_MARKER: 由 deploy_mem0_isolation.sh v4.1 写入于 $TIMESTAMP" \
+        echo "# MEM0_ISOLATION_MARKER: 由 install.sh v0.0.1 写入于 $TIMESTAMP" \
             >> "$env_path"
     fi
 }
@@ -523,7 +553,7 @@ else
 
 ---
 
-<!-- MULTI_USER_ISOLATION: 由 deploy_mem0_isolation.sh v4.1 写入，请勿删除此标记 -->
+<!-- MULTI_USER_ISOLATION: 由 install.sh v0.0.1 写入，请勿删除此标记 -->
 
 ## 多用户隔离行为约束（第二道防线）
 
@@ -558,7 +588,7 @@ echo "  mem0 可导入：$MEM0_IMPORT"
 
 echo ""
 log_info "── Mem0 本地模式 smoke test（PASS 不代表生产链路已生效）──"
-SMOKE_RESULT=$(smoke_test_mem0_isolation "$HERMES_PYTHON" "$HERMES_HOME/hermes-agent" 2>&1)
+SMOKE_RESULT=$(smoke_test_mem0_isolation "$HERMES_PYTHON" "$HERMES_AGENT_DIR" 2>&1)
 echo "  $SMOKE_RESULT"
 if echo "$SMOKE_RESULT" | grep -q "^SMOKE_FAIL"; then
     log_error "mem0 本地模式隔离异常，请检查插件与依赖后重新部署。"
@@ -580,7 +610,7 @@ log_warn "  1. memory.provider = mem0"
 log_warn "  2. tools.disabled 包含 session_search"
 log_warn "如果看不到，说明 config.yaml 字段名未被当前 Hermes 版本识别，"
 log_warn "需执行 hermes config set --help 查阅正确字段名。"
-log_warn "Hermes 更新后若插件被覆盖，可执行：$SCRIPT_DIR/mem0_post_update_selfheal.sh"
+log_warn "Hermes 更新后若插件被覆盖，可执行：$SCRIPT_DIR/doctor.sh"
 
 echo ""
 echo -e "╔══════════════════════════════════════════════════════╗"
@@ -619,9 +649,9 @@ cat <<SUMMARY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   cp -r ${MEM0_DATA_DIR} ~/hermes_mem0_backup_\$(date +%Y%m%d)/
 
-【回滚】./rollback_mem0_isolation.sh
-【卸载】./uninstall_mem0_isolation.sh
-【更新后自愈】./mem0_post_update_selfheal.sh
+【回滚】./rollback.sh
+【卸载】./uninstall.sh
+【更新后自愈】./doctor.sh
 【加固说明】USER.md 已自动设置为只读（chmod 444）
 
 SUMMARY

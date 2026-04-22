@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# mem0_post_update_selfheal.sh
+# doctor.sh
 #
 # 作用：
 #   1) Hermes 更新后，一键自检本地 Mem0 方案是否仍生效
@@ -10,21 +10,50 @@
 #      - mem0 插件被更新覆盖（从本地缓存恢复）
 #
 # 用法：
-#   ./mem0_post_update_selfheal.sh
-#   ./mem0_post_update_selfheal.sh --patch-only
-#   ./mem0_post_update_selfheal.sh --check-only
+#   ./doctor.sh
+#   ./doctor.sh --patch-only
+#   ./doctor.sh --check-only
 # =============================================================================
 
 set -euo pipefail
 
-HERMES_HOME="/Users/p/.hermes"
-HERMES_PYTHON="/Users/p/.hermes/hermes-agent/venv/bin/python3"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── 路径自动探测：hermes shebang → HERMES_PYTHON → 上4级 → HERMES_HOME ──
+_detect_hermes_paths() {
+    if [[ -z "${HERMES_PYTHON:-}" ]]; then
+        local _bin _py
+        _bin=$(command -v hermes 2>/dev/null || true)
+        if [[ -n "$_bin" ]]; then
+            _py=$(head -1 "$_bin" 2>/dev/null | sed 's/^#!//' | tr -d '[:space:]')
+            [[ "$_py" == *python* && -x "$_py" ]] && HERMES_PYTHON="$_py"
+        fi
+    fi
+    if [[ -n "${HERMES_PYTHON:-}" ]]; then
+        [[ -z "${HERMES_AGENT_DIR:-}" ]] && \
+            HERMES_AGENT_DIR="$(dirname "$(dirname "$(dirname "$HERMES_PYTHON")")")"
+        [[ -z "${HERMES_HOME:-}" ]] && \
+            HERMES_HOME="$(dirname "$HERMES_AGENT_DIR")"
+    fi
+    HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+    HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
+    HERMES_PYTHON="${HERMES_PYTHON:-$HERMES_AGENT_DIR/venv/bin/python3}"
+    if [[ ! -d "$HERMES_HOME" ]]; then
+        echo "[ERROR] Hermes 主目录不存在：$HERMES_HOME"
+        echo "  请手动设置：export HERMES_HOME=/your/hermes/path"; exit 1
+    fi
+    if [[ ! -x "$HERMES_PYTHON" ]]; then
+        echo "[ERROR] Python 解释器不可执行：$HERMES_PYTHON"
+        echo "  请手动设置：export HERMES_PYTHON=/path/to/python3"; exit 1
+    fi
+}
+
+_detect_hermes_paths
 
 CONFIG_FILE="$HERMES_HOME/config.yaml"
 ENV_FILE="$HERMES_HOME/.env"
-PLUGIN_FILE="$HERMES_HOME/hermes-agent/plugins/memory/mem0/__init__.py"
-PLUGIN_CACHE_FILE="$SCRIPT_DIR/mem0_plugin_local.cached.py"
+PLUGIN_FILE="$HERMES_AGENT_DIR/plugins/memory/mem0/__init__.py"
+PLUGIN_CACHE_FILE="$SCRIPT_DIR/mem0_plugin_patch.py"
 BACKUP_DIR="$HERMES_HOME/backups/mem0_selfheal_$(date +%Y%m%d_%H%M%S)"
 MEM0_DATA_DIR="$HERMES_HOME/mem0_data"
 

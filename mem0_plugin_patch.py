@@ -1,18 +1,18 @@
-"""Mem0 memory plugin — MemoryProvider interface.
+"""Mem0 记忆插件 — MemoryProvider 接口实现。
 
-Supports two modes:
-1) cloud: Mem0 Platform API via MemoryClient (requires real MEM0_API_KEY)
-2) local: local vector store + local embedder via Memory
+支持两种模式：
+1) cloud：通过 MemoryClient 调用 Mem0 Platform API（需要真实的 MEM0_API_KEY）
+2) local：通过 Memory 使用本地向量库 + 本地 Embedder
 
-Config via environment variables:
-  MEM0_STORAGE_MODE  — local|cloud (default: cloud)
-  MEM0_STORAGE_PATH  — local storage path (default: ~/.hermes/mem0_data)
-  MEM0_EMBEDDER      — local/fastembed/openai/... (default: local)
-  MEM0_API_KEY       — Mem0 Platform API key (required for cloud mode)
-  MEM0_USER_ID       — User identifier (default: hermes-user)
-  MEM0_AGENT_ID      — Agent identifier (default: hermes)
+环境变量配置：
+  MEM0_STORAGE_MODE  — local|cloud（默认：cloud）
+  MEM0_STORAGE_PATH  — 本地存储路径（默认：~/.hermes/mem0_data）
+  MEM0_EMBEDDER      — local/fastembed/openai/...（默认：local）
+  MEM0_API_KEY       — Mem0 Platform API Key（cloud 模式必填）
+  MEM0_USER_ID       — 用户标识（默认：hermes-user）
+  MEM0_AGENT_ID      — Agent 标识（默认：hermes）
 
-Overrides via $HERMES_HOME/mem0.json are still supported.
+仍支持通过 $HERMES_HOME/mem0.json 覆盖单个配置项。
 """
 
 from __future__ import annotations
@@ -30,27 +30,26 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-# Circuit breaker: after this many consecutive failures, pause API calls
-# for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
+# 熔断器：连续失败次数超过阈值后，暂停 API 调用一段时间，避免持续打挂服务。
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 
-# Process-wide cache for local-mode clients.
-# Qdrant local storage allows only a single opener per process/path combo.
+# 进程级本地客户端缓存。
+# Qdrant 本地存储同一时刻只允许一个进程/路径组合持有锁，
+# 通过复用同一个客户端实例避免并发时的文件锁冲突。
 _LOCAL_CLIENTS: Dict[str, Any] = {}
 _LOCAL_CLIENTS_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# Config
+# 配置加载
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
+    """从环境变量加载配置，$HERMES_HOME/mem0.json 中的值可覆盖单个字段。
 
-    Environment variables provide defaults; mem0.json (if present) overrides
-    individual keys.  This avoids a silent failure when the JSON file exists
-    but is missing fields like ``api_key`` that the user set in ``.env``.
+    以环境变量为基础默认值，mem0.json（如存在）只覆盖其中有值的字段，
+    避免 JSON 文件存在但缺少 api_key 等字段时发生静默失败。
     """
     from hermes_constants import get_hermes_home
 
@@ -67,7 +66,7 @@ def _load_config() -> dict:
         "rerank": True,
         "keyword_search": False,
     }
-    # Best-effort read from config.yaml memory.settings for local mode knobs.
+    # 尽力从 config.yaml 的 memory.settings 读取本地模式配置项
     config_yaml = hermes_home / "config.yaml"
     if config_yaml.exists():
         try:
@@ -99,7 +98,7 @@ def _load_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas
+# 工具 Schema 定义（description 保留英文，供 LLM 理解）
 # ---------------------------------------------------------------------------
 
 PROFILE_SCHEMA = {
@@ -145,11 +144,11 @@ CONCLUDE_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
-# MemoryProvider implementation
+# MemoryProvider 实现
 # ---------------------------------------------------------------------------
 
 class Mem0MemoryProvider(MemoryProvider):
-    """Mem0 Platform memory with server-side extraction and semantic search."""
+    """基于 Mem0 的记忆 Provider，支持本地模式和云端模式。"""
 
     def __init__(self):
         self._config = None
@@ -166,7 +165,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._sync_thread = None
-        # Circuit breaker state
+        # 熔断器状态
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
 
@@ -179,7 +178,7 @@ class Mem0MemoryProvider(MemoryProvider):
         return cfg.get("storage_mode", "cloud") == "local" or bool(cfg.get("api_key"))
 
     def save_config(self, values, hermes_home):
-        """Write config to $HERMES_HOME/mem0.json."""
+        """将配置写入 $HERMES_HOME/mem0.json。"""
         import json
         from pathlib import Path
         config_path = Path(hermes_home) / "mem0.json"
@@ -194,14 +193,14 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def get_config_schema(self):
         return [
-            {"key": "api_key", "description": "Mem0 Platform API key (cloud mode only)", "secret": True, "required": False, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
-            {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
-            {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
+            {"key": "api_key", "description": "Mem0 Platform API key（仅 cloud 模式需要）", "secret": True, "required": False, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
+            {"key": "user_id", "description": "用户标识", "default": "hermes-user"},
+            {"key": "agent_id", "description": "Agent 标识", "default": "hermes"},
+            {"key": "rerank", "description": "是否启用重排序提升召回精度", "default": "true", "choices": ["true", "false"]},
         ]
 
     def _get_client(self):
-        """Thread-safe client accessor with lazy initialization."""
+        """线程安全的客户端访问器，延迟初始化。"""
         with self._client_lock:
             if self._client is not None:
                 return self._client
@@ -216,28 +215,28 @@ class Mem0MemoryProvider(MemoryProvider):
             except ImportError:
                 if self._storage_mode == "local":
                     raise RuntimeError(
-                        "mem0 local mode dependencies missing. Run: pip install mem0ai fastembed"
+                        "本地模式依赖缺失，请执行：pip install mem0ai fastembed"
                     )
-                raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
+                raise RuntimeError("mem0 包未安装，请执行：pip install mem0ai")
             except Exception as e:
                 if self._storage_mode == "local":
                     if "already accessed by another instance" in str(e):
                         raise RuntimeError(
-                            "Mem0 local storage is locked by another process. "
-                            "If multiple Hermes processes are running, keep only one Gateway "
-                            "or switch to Qdrant server mode for true multi-process concurrency."
+                            "Mem0 本地存储已被另一个进程锁定。"
+                            "请确保只运行一个 Hermes Gateway 实例，"
+                            "或切换到 Qdrant Server 模式以支持多进程并发。"
                         )
-                    raise RuntimeError(f"Mem0 local mode init failed: {e}")
+                    raise RuntimeError(f"Mem0 本地模式初始化失败：{e}")
                 raise
 
     def _local_client_cache_key(self) -> str:
-        """Stable cache key for local process-wide client reuse."""
+        """生成本地进程级客户端复用的稳定缓存 Key。"""
         path = str(Path(self._storage_path).resolve())
         embedder = (self._embedder or "local").lower()
         return f"{path}|{embedder}"
 
     def _get_or_create_shared_local_client(self):
-        """Reuse one local Memory client per process/path to avoid lock conflicts."""
+        """每个进程/路径组合只创建一个本地 Memory 客户端，避免文件锁冲突。"""
         key = self._local_client_cache_key()
         with _LOCAL_CLIENTS_LOCK:
             cached = _LOCAL_CLIENTS.get(key)
@@ -246,15 +245,15 @@ class Mem0MemoryProvider(MemoryProvider):
 
             from mem0 import Memory
 
-            # Ensure local storage path exists early to avoid opaque runtime errors.
+            # 提前创建存储目录，避免运行时报晦涩的路径错误
             Path(self._storage_path).mkdir(parents=True, exist_ok=True)
             client = Memory.from_config(self._build_local_memory_config())
             _LOCAL_CLIENTS[key] = client
             return client
 
     def _build_local_memory_config(self) -> Dict[str, Any]:
-        """Construct local Memory() config from plugin settings."""
-        # mem0 'local' is not a provider; map it to fastembed (fully local).
+        """根据插件配置构建 local Memory() 初始化参数。"""
+        # mem0 的 'local' 不是有效的 embedder provider，映射为 fastembed（纯本地推理）
         embedder_provider = (self._embedder or "local").lower()
         if embedder_provider == "local":
             embedder_provider = "fastembed"
@@ -268,7 +267,7 @@ class Mem0MemoryProvider(MemoryProvider):
             "collection_name": "hermes_mem0_local",
         }
         if embedder_provider == "fastembed":
-            # BAAI/bge-small-en-v1.5 dimension
+            # BAAI/bge-small-en-v1.5 的向量维度为 384
             qdrant_config["embedding_model_dims"] = 384
 
         return {
@@ -277,8 +276,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 "config": qdrant_config,
             },
             "embedder": embedder_cfg,
-            # Keep llm configured with a placeholder key so Memory can initialize
-            # without requiring a real cloud key; local mode writes use infer=False.
+            # 本地模式写入使用 infer=False，不需要真实 LLM Key；
+            # 但 Memory 初始化时仍要求 llm 配置存在，用 placeholder 绕过。
             "llm": {
                 "provider": "openai",
                 "config": {"api_key": self._api_key or "local-placeholder"},
@@ -287,11 +286,11 @@ class Mem0MemoryProvider(MemoryProvider):
         }
 
     def _is_breaker_open(self) -> bool:
-        """Return True if the circuit breaker is tripped (too many failures)."""
+        """熔断器是否已打开（连续失败次数超过阈值）。"""
         if self._consecutive_failures < _BREAKER_THRESHOLD:
             return False
         if time.monotonic() >= self._breaker_open_until:
-            # Cooldown expired — reset and allow a retry
+            # 冷却期结束，重置计数，允许重试
             self._consecutive_failures = 0
             return False
         return True
@@ -304,8 +303,7 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._consecutive_failures >= _BREAKER_THRESHOLD:
             self._breaker_open_until = time.monotonic() + _BREAKER_COOLDOWN_SECS
             logger.warning(
-                "Mem0 circuit breaker tripped after %d consecutive failures. "
-                "Pausing API calls for %ds.",
+                "Mem0 熔断器触发：连续失败 %d 次，暂停 API 调用 %d 秒。",
                 self._consecutive_failures, _BREAKER_COOLDOWN_SECS,
             )
 
@@ -315,25 +313,25 @@ class Mem0MemoryProvider(MemoryProvider):
         self._storage_path = str(self._config.get("storage_path", "")).strip()
         self._embedder = str(self._config.get("embedder", "local")).strip()
         self._api_key = self._config.get("api_key", "")
-        # Prefer gateway-provided user_id for per-user memory scoping;
-        # fall back to config/env default for CLI (single-user) sessions.
+        # 优先使用 Gateway 传入的 user_id 实现多用户隔离；
+        # CLI 单用户场景降级为配置/环境变量中的默认值。
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
         if self._storage_mode != "local" and not self._api_key:
-            logger.warning("Mem0 cloud mode active but MEM0_API_KEY is empty.")
+            logger.warning("Mem0 cloud 模式已激活，但 MEM0_API_KEY 为空。")
 
     def _read_filters(self) -> Dict[str, Any]:
-        """Filters for search/get_all — scoped to user only for cross-session recall."""
+        """查询过滤器：仅返回当前用户的记忆，实现跨会话召回。"""
         return {"user_id": self._user_id}
 
     def _write_filters(self) -> Dict[str, Any]:
-        """Filters for add — scoped to user + agent for attribution."""
+        """写入过滤器：按用户 + Agent 归因存储。"""
         return {"user_id": self._user_id, "agent_id": self._agent_id}
 
     @staticmethod
     def _unwrap_results(response: Any) -> list:
-        """Normalize Mem0 API response — v2 wraps results in {"results": [...]}."""
+        """统一 Mem0 API 响应格式——v2 版本将结果包在 {"results": [...]} 中。"""
         if isinstance(response, dict):
             return response.get("results", [])
         if isinstance(response, list):
@@ -378,13 +376,13 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
             except Exception as e:
                 self._record_failure()
-                logger.debug("Mem0 prefetch failed: %s", e)
+                logger.debug("Mem0 预取失败：%s", e)
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        """将当前轮对话异步同步到 Mem0（非阻塞）。"""
         if self._is_breaker_open():
             return
 
@@ -403,9 +401,9 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
             except Exception as e:
                 self._record_failure()
-                logger.warning("Mem0 sync failed: %s", e)
+                logger.warning("Mem0 同步失败：%s", e)
 
-        # Wait for any previous sync before starting a new one
+        # 等待上一次同步完成后再开始新的
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
 
@@ -418,7 +416,7 @@ class Mem0MemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._is_breaker_open():
             return json.dumps({
-                "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
+                "error": "Mem0 API 暂时不可用（连续多次失败），稍后将自动重试。"
             })
 
         try:
@@ -431,17 +429,17 @@ class Mem0MemoryProvider(MemoryProvider):
                 memories = self._unwrap_results(client.get_all(filters=self._read_filters()))
                 self._record_success()
                 if not memories:
-                    return json.dumps({"result": "No memories stored yet."})
+                    return json.dumps({"result": "暂无存储的记忆。"})
                 lines = [m.get("memory", "") for m in memories if m.get("memory")]
                 return json.dumps({"result": "\n".join(lines), "count": len(lines)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to fetch profile: {e}")
+                return tool_error(f"获取记忆失败：{e}")
 
         elif tool_name == "mem0_search":
             query = args.get("query", "")
             if not query:
-                return tool_error("Missing required parameter: query")
+                return tool_error("缺少必填参数：query")
             rerank = args.get("rerank", False)
             top_k = min(int(args.get("top_k", 10)), 50)
             try:
@@ -453,17 +451,17 @@ class Mem0MemoryProvider(MemoryProvider):
                 ))
                 self._record_success()
                 if not results:
-                    return json.dumps({"result": "No relevant memories found."})
+                    return json.dumps({"result": "未找到相关记忆。"})
                 items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
                 return json.dumps({"results": items, "count": len(items)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Search failed: {e}")
+                return tool_error(f"搜索失败：{e}")
 
         elif tool_name == "mem0_conclude":
             conclusion = args.get("conclusion", "")
             if not conclusion:
-                return tool_error("Missing required parameter: conclusion")
+                return tool_error("缺少必填参数：conclusion")
             try:
                 client.add(
                     [{"role": "user", "content": conclusion}],
@@ -471,12 +469,12 @@ class Mem0MemoryProvider(MemoryProvider):
                     infer=False,
                 )
                 self._record_success()
-                return json.dumps({"result": "Fact stored."})
+                return json.dumps({"result": "记忆已存储。"})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to store: {e}")
+                return tool_error(f"存储失败：{e}")
 
-        return tool_error(f"Unknown tool: {tool_name}")
+        return tool_error(f"未知工具：{tool_name}")
 
     def shutdown(self) -> None:
         for t in (self._prefetch_thread, self._sync_thread):
@@ -487,5 +485,5 @@ class Mem0MemoryProvider(MemoryProvider):
 
 
 def register(ctx) -> None:
-    """Register Mem0 as a memory provider plugin."""
+    """将 Mem0 注册为记忆 Provider 插件。"""
     ctx.register_memory_provider(Mem0MemoryProvider())

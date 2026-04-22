@@ -1,28 +1,50 @@
 #!/usr/bin/env bash
 # =============================================================================
-# uninstall_mem0_isolation.sh  v4.0
-#
-# 修订说明（v4.0）：
-#   [同步] 与 deploy v4.1 对齐：补充 fastembed 卸载与缓存清理
-#   [新增] --uninstall-fastembed 参数（默认跳过，避免误伤）
-#   [新增] 清理 mem0 插件本地缓存 mem0_plugin_local.cached.py
-# 修订说明（v3.5）：
-#   [同步] 与 deploy v3.8 对齐：文档中统一使用 config show/list 口径
-# 修订说明（v3.4）：
-#   [高修复] 新增步骤 0：HERMES_PYTHON 可执行性硬校验，
-#            路径失效时立即退出并打印修复提示，不再"假成功"跳过
-#   [中修复] 单点校验补全：uninstall 现在与 deploy 一样，
-#            在开始阶段就验证 HERMES_HOME 和 HERMES_PYTHON
+# uninstall.sh  v0.0.1
 # =============================================================================
 
 set -euo pipefail
 
 # ══════════════════════════════════════════════
-# 本地配置区（环境迁移时只需改这里）
+# 路径自动探测（通常无需任何配置）
+#
+# 推导链：hermes shebang → HERMES_PYTHON → 上4级 → HERMES_HOME
+# 如需手动覆盖，执行前 export 即可：
+#   export HERMES_HOME=/your/hermes/path
+#   export HERMES_PYTHON=/path/to/python3
 # ══════════════════════════════════════════════
 
-HERMES_HOME="/Users/p/.hermes"
-HERMES_PYTHON="/Users/p/.hermes/hermes-agent/venv/bin/python3"
+_detect_hermes_paths() {
+    if [[ -z "${HERMES_PYTHON:-}" ]]; then
+        local _bin _py
+        _bin=$(command -v hermes 2>/dev/null || true)
+        if [[ -n "$_bin" ]]; then
+            _py=$(head -1 "$_bin" 2>/dev/null | sed 's/^#!//' | tr -d '[:space:]')
+            [[ "$_py" == *python* && -x "$_py" ]] && HERMES_PYTHON="$_py"
+        fi
+    fi
+    if [[ -n "${HERMES_PYTHON:-}" ]]; then
+        [[ -z "${HERMES_AGENT_DIR:-}" ]] && \
+            HERMES_AGENT_DIR="$(dirname "$(dirname "$(dirname "$HERMES_PYTHON")")")"
+        [[ -z "${HERMES_HOME:-}" ]] && \
+            HERMES_HOME="$(dirname "$HERMES_AGENT_DIR")"
+    fi
+    HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+    HERMES_AGENT_DIR="${HERMES_AGENT_DIR:-$HERMES_HOME/hermes-agent}"
+    HERMES_PYTHON="${HERMES_PYTHON:-$HERMES_AGENT_DIR/venv/bin/python3}"
+    if [[ ! -d "$HERMES_HOME" ]]; then
+        echo "[ERROR] Hermes 主目录不存在：$HERMES_HOME"
+        echo "  请手动设置：export HERMES_HOME=/your/hermes/path"
+        exit 1
+    fi
+    if [[ ! -x "$HERMES_PYTHON" ]]; then
+        echo "[ERROR] Python 解释器不可执行：$HERMES_PYTHON"
+        echo "  请手动设置：export HERMES_PYTHON=/path/to/python3"
+        exit 1
+    fi
+}
+
+_detect_hermes_paths
 
 # 以下路径均基于 HERMES_HOME
 MEM0_DATA_DIR="$HERMES_HOME/mem0_data"
@@ -35,8 +57,8 @@ ENV_FILE="$HERMES_HOME/.env"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROLLBACK_SCRIPT="$SCRIPT_DIR/rollback_mem0_isolation.sh"
-CACHED_PLUGIN_FILE="$SCRIPT_DIR/mem0_plugin_local.cached.py"
+ROLLBACK_SCRIPT="$SCRIPT_DIR/rollback.sh"
+CACHED_PLUGIN_FILE="$SCRIPT_DIR/mem0_plugin_patch.py"
 
 # ─────────────────────────────────────────────
 # 参数解析
@@ -125,7 +147,7 @@ log_ok "Python 版本：$("$HERMES_PYTHON" --version 2>&1)"
 # 卸载确认
 # ─────────────────────────────────────────────
 
-log_section "Hermes Mem0 隔离方案完整卸载 v4.0"
+log_section "Hermes Mem0 隔离方案完整卸载 v0.0.1"
 
 echo ""
 log_warn "此操作将执行以下步骤："
@@ -202,7 +224,7 @@ fi
 
 # ─────────────────────────────────────────────
 # 步骤 4：可选卸载 fastembed
-# 与 deploy v4.1 对齐：fastembed 是本地 embedder 依赖
+# fastembed 是本地 embedder 依赖，随 install.sh 一起安装
 # ─────────────────────────────────────────────
 
 log_section "步骤 4 / 7：处理 fastembed"

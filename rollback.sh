@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
 # =============================================================================
-# rollback_mem0_isolation.sh  v3.5
-# 修订说明：
-#   [新增]     与 deploy v4.1 对齐：回滚时将 USER.md 权限恢复为可写（644）
-#   [同步]     与 deploy v3.8 对齐：文档中统一使用 config show/list 口径
-#   [严重修复] HERMES_HOME 写死为实际路径
-#   [中修复]   --yes 只确认回滚流程，--purge-data 才自动确认删除数据
+# rollback.sh  v0.0.1
 # =============================================================================
 
 set -euo pipefail
 
 # ══════════════════════════════════════════════
-# 本地配置区
+# 路径自动探测（通常无需任何配置）
+#
+# 如需手动覆盖：export HERMES_HOME=/your/hermes/path
 # ══════════════════════════════════════════════
 
-HERMES_HOME="/Users/p/.hermes"
+_detect_hermes_home() {
+    if [[ -z "${HERMES_HOME:-}" ]]; then
+        local _bin _py
+        _bin=$(command -v hermes 2>/dev/null || true)
+        if [[ -n "$_bin" ]]; then
+            _py=$(head -1 "$_bin" 2>/dev/null | sed 's/^#!//' | tr -d '[:space:]')
+            if [[ "$_py" == *python* && -x "$_py" ]]; then
+                HERMES_HOME="$(dirname "$(dirname "$(dirname "$(dirname "$_py")")")")"
+            fi
+        fi
+    fi
+    HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+    if [[ ! -d "$HERMES_HOME" ]]; then
+        echo "[ERROR] Hermes 主目录不存在：$HERMES_HOME"
+        echo "  请手动设置：export HERMES_HOME=/your/hermes/path"
+        exit 1
+    fi
+}
+
+_detect_hermes_home
 
 # 以下路径均基于 HERMES_HOME
 CONFIG_FILE="$HERMES_HOME/config.yaml"
@@ -83,7 +99,7 @@ confirm_destructive() {
 # 确定原始备份目录
 # ─────────────────────────────────────────────
 
-log_section "Hermes Mem0 隔离方案回滚 v3.3"
+log_section "Hermes Mem0 隔离方案回滚 v0.0.1"
 log_info "HERMES_HOME = $HERMES_HOME"
 
 if [[ -n "$MANUAL_BACKUP_DIR" ]]; then
@@ -94,7 +110,7 @@ elif [[ -f "$HERMES_HOME/.last_backup_path" ]]; then
     log_info "自动读取最近备份目录：$BACKUP_DIR"
 else
     log_error "未找到备份路径记录，请手动指定备份目录："
-    log_error "  ./rollback_mem0_isolation.sh \$HERMES_HOME/backups/mem0_isolation_<timestamp>"
+    log_error "  ./rollback.sh \$HERMES_HOME/backups/mem0_isolation_<timestamp>"
     exit 1
 fi
 
@@ -158,8 +174,7 @@ else
     log_info "备份中无 USER.md.bak（部署前本就不存在），跳过"
 fi
 
-# 与 deploy v4.1 对齐：部署时会将 USER.md 加固为 444。
-# 回滚后恢复为 644，避免后续人工编辑受阻。
+# install.sh 部署时将 USER.md 加固为 444，回滚后恢复为 644。
 if [[ -f "$USER_FILE" ]]; then
     chmod 644 "$USER_FILE" 2>/dev/null || true
     log_ok "USER.md 权限已恢复为可写（644）"
@@ -232,7 +247,7 @@ cat <<ROLLBACK_SUMMARY
    └── mem0_data_snapshot/    （如选择删除数据，此处有快照）
 
 ℹ️  未卸载：mem0ai / PyYAML
-   如需卸载，请运行：./uninstall_mem0_isolation.sh
+   如需卸载，请运行：./uninstall.sh
 
 下一步：重启 Hermes Gateway 使配置生效
   hermes gateway stop
