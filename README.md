@@ -157,7 +157,37 @@ cp -r ~/.hermes/mem0_data ~/hermes_mem0_backup_$(date +%Y%m%d)/
 - **记忆隔离**：Mem0 在写入（`add`）和查询（`search` / `get_all`）时均携带 `user_id` 过滤条件，Qdrant 在 payload 层过滤，不同用户的向量物理上存在同一个 collection 但查询结果完全隔离。
 - **无 LLM 抽取**：本地模式使用 `infer=False`，对话原文直接存入向量库，不依赖 OpenAI API。
 - **Qdrant 文件锁**：本地 Qdrant 单进程持锁，插件通过进程级单例（`_LOCAL_CLIENTS`）复用同一个客户端实例，避免多协程并发时的锁冲突。
-- **FastEmbed**：使用 `BAAI/bge-small-en-v1.5`（384 维），纯本地推理，无需联网。
+- **FastEmbed**：默认使用 `BAAI/bge-small-zh-v1.5`（512 维），更适合中文语义检索。
+
+---
+
+## Embedding 模型下载来源与外网失败处理
+
+- **默认下载来源**：首次运行时由 `fastembed` 自动拉取模型（默认源通常是 Hugging Face）。
+- **当前默认模型**：`BAAI/bge-small-zh-v1.5`（可通过环境变量 `MEM0_EMBEDDER_MODEL` 覆盖）。
+- **外网受限时的推荐方案**：先从国内社区（ModelScope）下载到本地目录，再把 `MEM0_EMBEDDER_MODEL` 指向该目录。
+- **脚本自动优先本地目录**：`install.sh` / `doctor.sh` 会按顺序自动探测：
+  - `$HERMES_HOME/mem0_models/bge-small-zh-v1.5`
+  - `~/.hermes/mem0_models/bge-small-zh-v1.5`
+  - 若都不存在，则回退到在线模型名 `BAAI/bge-small-zh-v1.5`
+- **默认自动下载到持久目录**：当未设置 `MEM0_EMBEDDER_MODEL` 且本地目录不存在时，脚本会自动尝试通过 ModelScope 下载到：
+  - `$HERMES_HOME/mem0_models/bge-small-zh-v1.5`
+  - 下载失败时才回退到在线模型名模式
+
+示例（以 ModelScope 为例）：
+
+```bash
+pip install modelscope
+modelscope download --model BAAI/bge-small-zh-v1.5 --local_dir ~/.hermes/mem0_models/bge-small-zh-v1.5
+echo 'MEM0_EMBEDDER_MODEL=~/.hermes/mem0_models/bge-small-zh-v1.5' >> ~/.hermes/.env
+```
+
+完成后重启 Gateway：
+
+```bash
+hermes gateway stop
+hermes gateway run
+```
 
 ---
 

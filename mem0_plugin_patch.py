@@ -8,6 +8,7 @@
   MEM0_STORAGE_MODE  — local|cloud（默认：cloud）
   MEM0_STORAGE_PATH  — 本地存储路径（默认：~/.hermes/mem0_data）
   MEM0_EMBEDDER      — local/fastembed/openai/...（默认：local）
+  MEM0_EMBEDDER_MODEL — FastEmbed 模型名或本地模型目录（默认：BAAI/bge-small-zh-v1.5）
   MEM0_API_KEY       — Mem0 Platform API Key（cloud 模式必填）
   MEM0_USER_ID       — 用户标识（默认：hermes-user）
   MEM0_AGENT_ID      — Agent 标识（默认：hermes）
@@ -60,6 +61,7 @@ def _load_config() -> dict:
         "storage_mode": os.environ.get("MEM0_STORAGE_MODE", "cloud"),
         "storage_path": os.environ.get("MEM0_STORAGE_PATH", default_local_path),
         "embedder": os.environ.get("MEM0_EMBEDDER", "local"),
+        "embedder_model": os.environ.get("MEM0_EMBEDDER_MODEL", "BAAI/bge-small-zh-v1.5"),
         "api_key": os.environ.get("MEM0_API_KEY", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
@@ -82,6 +84,8 @@ def _load_config() -> dict:
                     config["storage_path"] = settings["storage_path"]
                 if settings.get("embedder"):
                     config["embedder"] = settings["embedder"]
+                if settings.get("embedder_model"):
+                    config["embedder_model"] = settings["embedder_model"]
         except Exception:
             pass
 
@@ -158,6 +162,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._storage_mode = "cloud"
         self._storage_path = ""
         self._embedder = "local"
+        self._embedder_model = "BAAI/bge-small-zh-v1.5"
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
         self._rerank = True
@@ -260,15 +265,22 @@ class Mem0MemoryProvider(MemoryProvider):
 
         embedder_cfg: Dict[str, Any] = {"provider": embedder_provider, "config": {}}
         if embedder_provider == "fastembed":
-            embedder_cfg["config"] = {"model": "BAAI/bge-small-en-v1.5"}
+            embedder_model = (self._embedder_model or "BAAI/bge-small-zh-v1.5").strip()
+            embedder_cfg["config"] = {"model": embedder_model}
 
         qdrant_config: Dict[str, Any] = {
             "path": self._storage_path,
             "collection_name": "hermes_mem0_local",
         }
         if embedder_provider == "fastembed":
-            # BAAI/bge-small-en-v1.5 的向量维度为 384
-            qdrant_config["embedding_model_dims"] = 384
+            # 常用模型维度映射；未知模型（含本地目录）交由框架自动推断。
+            dims_by_model = {
+                "BAAI/bge-small-en-v1.5": 384,
+                "BAAI/bge-small-zh-v1.5": 512,
+            }
+            model_dims = dims_by_model.get(embedder_cfg["config"]["model"])
+            if model_dims:
+                qdrant_config["embedding_model_dims"] = model_dims
 
         return {
             "vector_store": {
@@ -312,6 +324,9 @@ class Mem0MemoryProvider(MemoryProvider):
         self._storage_mode = str(self._config.get("storage_mode", "cloud")).lower()
         self._storage_path = str(self._config.get("storage_path", "")).strip()
         self._embedder = str(self._config.get("embedder", "local")).strip()
+        self._embedder_model = str(
+            self._config.get("embedder_model", "BAAI/bge-small-zh-v1.5")
+        ).strip()
         self._api_key = self._config.get("api_key", "")
         # 优先使用 Gateway 传入的 user_id 实现多用户隔离；
         # CLI 单用户场景降级为配置/环境变量中的默认值。

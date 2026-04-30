@@ -56,6 +56,9 @@ PLUGIN_FILE="$HERMES_AGENT_DIR/plugins/memory/mem0/__init__.py"
 PLUGIN_CACHE_FILE="$SCRIPT_DIR/mem0_plugin_patch.py"
 BACKUP_DIR="$HERMES_HOME/backups/mem0_selfheal_$(date +%Y%m%d_%H%M%S)"
 MEM0_DATA_DIR="$HERMES_HOME/mem0_data"
+DEFAULT_EMBEDDER_MODEL="BAAI/bge-small-zh-v1.5"
+RESOLVED_EMBEDDER_MODEL="$DEFAULT_EMBEDDER_MODEL"
+PERSISTENT_EMBEDDER_MODEL_DIR="$HERMES_HOME/mem0_models/bge-small-zh-v1.5"
 
 PIP_TIMEOUT=120
 PIP_RETRIES=10
@@ -95,6 +98,73 @@ log_ok()    { echo "[OK]    $*"; }
 log_warn()  { echo "[WARN]  $*"; }
 log_error() { echo "[ERROR] $*"; }
 
+resolve_embedder_model() {
+  if [[ -n "${MEM0_EMBEDDER_MODEL:-}" ]]; then
+    RESOLVED_EMBEDDER_MODEL="$MEM0_EMBEDDER_MODEL"
+    log_info "检测到外部 MEM0_EMBEDDER_MODEL：$RESOLVED_EMBEDDER_MODEL"
+    return 0
+  fi
+
+  local candidates=(
+    "$PERSISTENT_EMBEDDER_MODEL_DIR"
+    "$HOME/.hermes/mem0_models/bge-small-zh-v1.5"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -d "$c" ]]; then
+      RESOLVED_EMBEDDER_MODEL="$c"
+      log_ok "检测到本地模型目录：$RESOLVED_EMBEDDER_MODEL"
+      return 0
+    fi
+  done
+
+  RESOLVED_EMBEDDER_MODEL="$DEFAULT_EMBEDDER_MODEL"
+  log_warn "未检测到本地中文模型目录，回退为在线模型：$RESOLVED_EMBEDDER_MODEL"
+}
+
+ensure_default_embedder_model_download() {
+  if [[ -n "${MEM0_EMBEDDER_MODEL:-}" ]]; then
+    return 0
+  fi
+  if [[ "$RESOLVED_EMBEDDER_MODEL" != "$DEFAULT_EMBEDDER_MODEL" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$PERSISTENT_EMBEDDER_MODEL_DIR")"
+  if [[ -d "$PERSISTENT_EMBEDDER_MODEL_DIR" ]]; then
+    RESOLVED_EMBEDDER_MODEL="$PERSISTENT_EMBEDDER_MODEL_DIR"
+    return 0
+  fi
+
+  log_info "未检测到本地 embedding 模型，尝试默认下载到：$PERSISTENT_EMBEDDER_MODEL_DIR"
+  ensure_pip
+
+  if ! "$HERMES_PYTHON" -m pip show modelscope >/dev/null 2>&1; then
+    log_info "安装 modelscope（用于下载模型）..."
+    if ! "$HERMES_PYTHON" -m pip install \
+      "modelscope>=1.20.0" \
+      --timeout "$PIP_TIMEOUT" \
+      --retries "$PIP_RETRIES" \
+      --quiet; then
+      log_warn "modelscope 安装失败，保持在线模型名模式。"
+      return 1
+    fi
+  fi
+
+  if "$HERMES_PYTHON" -m modelscope download \
+    --model "$DEFAULT_EMBEDDER_MODEL" \
+    --local_dir "$PERSISTENT_EMBEDDER_MODEL_DIR" >/dev/null 2>&1; then
+    if [[ -d "$PERSISTENT_EMBEDDER_MODEL_DIR" ]]; then
+      RESOLVED_EMBEDDER_MODEL="$PERSISTENT_EMBEDDER_MODEL_DIR"
+      log_ok "embedding 模型已下载到：$RESOLVED_EMBEDDER_MODEL"
+      return 0
+    fi
+  fi
+
+  log_warn "模型下载失败，保持在线模型名模式：$DEFAULT_EMBEDDER_MODEL"
+  return 1
+}
+
 plugin_is_local_ready() {
   local f="$1"
   rg --quiet "Supports two modes:" "$f" \
@@ -125,10 +195,10 @@ install_deps() {
 }
 
 sync_config_yaml() {
-  "$HERMES_PYTHON" - "$CONFIG_FILE" "$MEM0_DATA_DIR" <<'PY'
+  "$HERMES_PYTHON" - "$CONFIG_FILE" "$MEM0_DATA_DIR" "$RESOLVED_EMBEDDER_MODEL" <<'PY'
 import os, sys
 import yaml
-path, mem0_path = sys.argv[1], sys.argv[2]
+path, mem0_path, embedder_model = sys.argv[1], sys.argv[2], sys.argv[3]
 if os.path.exists(path):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -145,6 +215,7 @@ if not isinstance(cfg["memory"].get("settings"), dict):
 cfg["memory"]["settings"]["storage_mode"] = "local"
 cfg["memory"]["settings"]["storage_path"] = mem0_path
 cfg["memory"]["settings"]["embedder"] = "local"
+cfg["memory"]["settings"]["embedder_model"] = embedder_model
 if not isinstance(cfg.get("tools"), dict):
     cfg["tools"] = {}
 disabled = cfg["tools"].get("disabled", [])
@@ -170,6 +241,7 @@ sync_env() {
     "MEM0_STORAGE_MODE=local" \
     "MEM0_STORAGE_PATH=$MEM0_DATA_DIR" \
     "MEM0_EMBEDDER=local" \
+    "MEM0_EMBEDDER_MODEL=$RESOLVED_EMBEDDER_MODEL" \
     "MEM0_API_KEY=local-placeholder"; do
     key="${kv%%=*}"
     val="${kv#*=}"
@@ -256,6 +328,8 @@ main() {
   log_info "开始 Mem0 更新后自检/自愈"
   log_info "HERMES_HOME=$HERMES_HOME"
   log_info "HERMES_PYTHON=$HERMES_PYTHON"
+  resolve_embedder_model
+  log_info "MEM0_EMBEDDER_MODEL(预解析)=$RESOLVED_EMBEDDER_MODEL"
 
   [[ -d "$HERMES_HOME" ]] || { log_error "目录不存在：$HERMES_HOME"; exit 1; }
   [[ -x "$HERMES_PYTHON" ]] || { log_error "解释器不可执行：$HERMES_PYTHON"; exit 1; }
@@ -272,6 +346,9 @@ main() {
   fi
 
   install_deps
+  ensure_default_embedder_model_download || true
+  resolve_embedder_model
+  log_info "MEM0_EMBEDDER_MODEL(最终)=$RESOLVED_EMBEDDER_MODEL"
   sync_config_yaml
   sync_env
   check_status

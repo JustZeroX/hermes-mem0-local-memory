@@ -87,6 +87,9 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 BACKUP_DIR="$HERMES_HOME/backups/mem0_isolation_$TIMESTAMP"
 PIP_TIMEOUT=120
 PIP_RETRIES=10
+DEFAULT_EMBEDDER_MODEL="BAAI/bge-small-zh-v1.5"
+RESOLVED_EMBEDDER_MODEL="$DEFAULT_EMBEDDER_MODEL"
+PERSISTENT_EMBEDDER_MODEL_DIR="$HERMES_HOME/mem0_models/bge-small-zh-v1.5"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; NC='\033[0m'
@@ -149,6 +152,79 @@ show_hermes_config() {
     return 1
 }
 
+resolve_embedder_model() {
+    # 优先级：
+    # 1) 外部显式传入 MEM0_EMBEDDER_MODEL
+    # 2) 常见持久化本地模型目录（不使用临时缓存目录）
+    # 3) 在线模型名（让 fastembed 自动下载）
+    if [[ -n "${MEM0_EMBEDDER_MODEL:-}" ]]; then
+        RESOLVED_EMBEDDER_MODEL="$MEM0_EMBEDDER_MODEL"
+        log_info "检测到外部 MEM0_EMBEDDER_MODEL：$RESOLVED_EMBEDDER_MODEL"
+        return 0
+    fi
+
+    local candidates=(
+        "$PERSISTENT_EMBEDDER_MODEL_DIR"
+        "$HOME/.hermes/mem0_models/bge-small-zh-v1.5"
+    )
+
+    local c
+    for c in "${candidates[@]}"; do
+        if [[ -d "$c" ]]; then
+            RESOLVED_EMBEDDER_MODEL="$c"
+            log_ok "检测到本地模型目录：$RESOLVED_EMBEDDER_MODEL"
+            return 0
+        fi
+    done
+
+    RESOLVED_EMBEDDER_MODEL="$DEFAULT_EMBEDDER_MODEL"
+    log_warn "未检测到本地中文模型目录，回退为在线模型：$RESOLVED_EMBEDDER_MODEL"
+}
+
+ensure_default_embedder_model_download() {
+    # 仅在未显式指定 MEM0_EMBEDDER_MODEL 且未命中本地目录时触发。
+    if [[ -n "${MEM0_EMBEDDER_MODEL:-}" ]]; then
+        return 0
+    fi
+    if [[ "$RESOLVED_EMBEDDER_MODEL" != "$DEFAULT_EMBEDDER_MODEL" ]]; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$PERSISTENT_EMBEDDER_MODEL_DIR")"
+    if [[ -d "$PERSISTENT_EMBEDDER_MODEL_DIR" ]]; then
+        RESOLVED_EMBEDDER_MODEL="$PERSISTENT_EMBEDDER_MODEL_DIR"
+        return 0
+    fi
+
+    log_info "未检测到本地 embedding 模型，尝试默认下载到：$PERSISTENT_EMBEDDER_MODEL_DIR"
+    ensure_pip_available "$HERMES_PYTHON"
+
+    if ! "$HERMES_PYTHON" -m pip show modelscope >/dev/null 2>&1; then
+        log_info "安装 modelscope（用于下载模型）..."
+        if ! "$HERMES_PYTHON" -m pip install \
+            "modelscope>=1.20.0" \
+            --timeout "$PIP_TIMEOUT" \
+            --retries "$PIP_RETRIES" \
+            --quiet; then
+            log_warn "modelscope 安装失败，保持在线模型名模式。"
+            return 1
+        fi
+    fi
+
+    if "$HERMES_PYTHON" -m modelscope download \
+        --model "$DEFAULT_EMBEDDER_MODEL" \
+        --local_dir "$PERSISTENT_EMBEDDER_MODEL_DIR" >/dev/null 2>&1; then
+        if [[ -d "$PERSISTENT_EMBEDDER_MODEL_DIR" ]]; then
+            RESOLVED_EMBEDDER_MODEL="$PERSISTENT_EMBEDDER_MODEL_DIR"
+            log_ok "embedding 模型已下载到：$RESOLVED_EMBEDDER_MODEL"
+            return 0
+        fi
+    fi
+
+    log_warn "模型下载失败，保持在线模型名模式：$DEFAULT_EMBEDDER_MODEL"
+    return 1
+}
+
 ensure_mem0_plugin_local_support() {
     local plugin_file="$1"
 
@@ -197,16 +273,18 @@ write_yaml_config() {
     local python_bin="$1"
     local config_path="$2"
     local mem0_data_path="$3"
+    local embedder_model="$4"
 
     log_warn "config.yaml 将被 PyYAML 整文件重写，原有注释和自定义排版会丢失。"
     log_warn "原始文件已备份至：$BACKUP_DIR/config.yaml.bak，如需恢复可从备份还原。"
     log_info "使用 PyYAML 解析并合并 config.yaml..."
 
-    "$python_bin" - "$config_path" "$mem0_data_path" <<'PYEOF'
+    "$python_bin" - "$config_path" "$mem0_data_path" "$embedder_model" <<'PYEOF'
 import sys, os
 
 config_path    = sys.argv[1]
 mem0_data_path = sys.argv[2]
+embedder_model = sys.argv[3]
 
 try:
     import yaml
@@ -242,6 +320,7 @@ if not isinstance(config["memory"].get("settings"), dict):
 config["memory"]["settings"]["storage_mode"] = "local"
 config["memory"]["settings"]["storage_path"] = mem0_data_path
 config["memory"]["settings"]["embedder"]     = "local"
+config["memory"]["settings"]["embedder_model"] = embedder_model
 
 # ── 写入 tools 配置 ──
 # 防御：tools 存在但不是 dict 时直接重置
@@ -294,10 +373,11 @@ PYEOF
 write_env_config() {
     local env_path="$1"
     local mem0_data_path="$2"
+    local embedder_model="$3"
 
     log_info "同步写入 .env 文件（Mem0 环境变量双通道）..."
 
-    local keys="MEM0_STORAGE_MODE MEM0_STORAGE_PATH MEM0_EMBEDDER MEM0_API_KEY"
+    local keys="MEM0_STORAGE_MODE MEM0_STORAGE_PATH MEM0_EMBEDDER MEM0_EMBEDDER_MODEL MEM0_API_KEY"
 
     for key in $keys; do
         local val
@@ -305,6 +385,7 @@ write_env_config() {
             MEM0_STORAGE_MODE) val="local" ;;
             MEM0_STORAGE_PATH) val="$mem0_data_path" ;;
             MEM0_EMBEDDER)     val="local" ;;
+            MEM0_EMBEDDER_MODEL) val="$embedder_model" ;;
             MEM0_API_KEY)      val="local-placeholder" ;;
         esac
 
@@ -403,6 +484,8 @@ log_section "步骤 1 / 7：前置环境检查"
 
 log_info "HERMES_HOME   = $HERMES_HOME"
 log_info "HERMES_PYTHON = $HERMES_PYTHON"
+resolve_embedder_model
+log_info "MEM0_EMBEDDER_MODEL(预解析) = $RESOLVED_EMBEDDER_MODEL"
 
 if [[ ! -d "$HERMES_HOME" ]]; then
     log_error "Hermes 主目录不存在：$HERMES_HOME"
@@ -507,6 +590,10 @@ else
     exit 1
 fi
 
+ensure_default_embedder_model_download || true
+resolve_embedder_model
+log_info "MEM0_EMBEDDER_MODEL(最终) = $RESOLVED_EMBEDDER_MODEL"
+
 if "$HERMES_PYTHON" -c \
        "import mem0; print('mem0 可导入，版本：', mem0.__version__)" \
        2>/dev/null; then
@@ -526,7 +613,7 @@ mkdir -p "$MEM0_DATA_DIR"
 log_ok "Mem0 数据目录：$MEM0_DATA_DIR"
 
 YAML_RESULT=$(write_yaml_config \
-    "$HERMES_PYTHON" "$CONFIG_FILE" "$MEM0_DATA_DIR" 2>&1)
+    "$HERMES_PYTHON" "$CONFIG_FILE" "$MEM0_DATA_DIR" "$RESOLVED_EMBEDDER_MODEL" 2>&1)
 
 case "$YAML_RESULT" in
     *"YAML_WRITE_OK"*)
@@ -555,7 +642,7 @@ grep -A 4 '^tools:' "$CONFIG_FILE" 2>/dev/null \
 
 log_section "步骤 5 / 7：同步写入 .env（环境变量双通道）"
 
-write_env_config "$ENV_FILE" "$MEM0_DATA_DIR"
+write_env_config "$ENV_FILE" "$MEM0_DATA_DIR" "$RESOLVED_EMBEDDER_MODEL"
 
 log_info "── 写入后 .env 中的 Mem0 变量 ──"
 grep "^MEM0_" "$ENV_FILE" 2>/dev/null \
